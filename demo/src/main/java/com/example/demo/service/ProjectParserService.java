@@ -9,11 +9,12 @@ import com.example.demo.entity.User;
 import com.example.demo.repository.AstNodeRepository;
 import com.example.demo.repository.ProjectRepository;
 import com.example.demo.repository.UserRepository;
-import com.github.javaparser.StaticJavaParser;
-import com.github.javaparser.ast.CompilationUnit;
-import com.github.javaparser.ast.body.ClassOrInterfaceDeclaration;
-import com.github.javaparser.ast.body.MethodDeclaration;
-import com.github.javaparser.ast.expr.AnnotationExpr;
+import jakarta.annotation.PostConstruct;
+import org.springframework.http.HttpEntity;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.MediaType;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.client.RestTemplate;
 import lombok.extern.slf4j.Slf4j;
 import org.eclipse.jgit.api.Git;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -23,19 +24,38 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.io.IOException;
+import java.nio.file.FileVisitResult;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
+import java.nio.file.SimpleFileVisitor;
+import java.nio.file.attribute.BasicFileAttributes;
+import java.util.*;
+import java.util.concurrent.*;
 import java.util.stream.Stream;
-
-//import static org.apache.tomcat.util.http.fileupload.FileUtils.deleteDirectory;
 
 @Service
 @Slf4j
 public class ProjectParserService {
+
+    private static final int BATCH_SIZE = 250;
+    private static final int MAX_FILE_SIZE = 500 * 1024;
+    private static final int HTTP_REQUEST_TIMEOUT = 120000;
+    private static final int THREAD_POOL_SIZE = Runtime.getRuntime().availableProcessors();
+
+    private static final Set<String> SKIP_DIRS = Set.of(
+            ".git", "node_modules", "dist", "build", ".next", "target",
+            "out", ".gradle", "__pycache__", ".venv", "vendor", ".vscode",
+            ".idea", ".DS_Store", "coverage", ".nyc_output", "test", "tests"
+    );
+
+    private static final Set<String> SUPPORTED_EXTENSIONS = Set.of(
+            "js", "jsx", "ts", "tsx", "py", "java", "go", "rs", "rb", "cs", "cpp", "c", "php"
+    );
+
+    private final ExecutorService fileReaderExecutor;
+    private final ExecutorService httpExecutor;
+    private final RestTemplate restTemplate;
+
     @Autowired
     private ProjectRepository projectRepository;
 
@@ -45,72 +65,87 @@ public class ProjectParserService {
     @Autowired
     private AstNodeRepository astNodeRepository;
 
-//    Upload a github Url and then parse the message
+    public ProjectParserService() {
+        // Java 17: Use ForkJoinPool for parallel file reading
+        this.fileReaderExecutor = new ForkJoinPool(THREAD_POOL_SIZE);
+        // Limited thread pool for HTTP requests
+        this.httpExecutor = Executors.newFixedThreadPool(Math.min(4, THREAD_POOL_SIZE));
+        this.restTemplate = createRestTemplate();
+    }
+
+    private RestTemplate createRestTemplate() {
+        RestTemplate template = new RestTemplate();
+        return template;
+    }
+
+    @PostConstruct
+    public void checkSidecarHealth() {
+        try {
+            ResponseEntity<Map> response = restTemplate.getForEntity(
+                    "http://localhost:3001/health",
+                    Map.class
+            );
+            if (response.getStatusCode().is2xxSuccessful()) {
+                log.info("Parser sidecar is healthy and ready.");
+            } else {
+                log.warn("Parser sidecar returned non-200 status: {}", response.getStatusCode());
+            }
+        } catch (Exception e) {
+            log.warn("Parser sidecar health check failed: http://localhost:3001/health", e);
+        }
+    }
+
     @Transactional
     public ParseResponse ParseProject(ParseRequest request) throws IOException {
-        String githuburl=request.getGithuburl();
+        String githuburl = request.getGithuburl();
         validateGithubUrl(githuburl);
 
-        User user=getAuthenticatedUser();
+        User user = getAuthenticatedUser();
 
-//        checking if project already exist
-//        if yes then delete this and create a new fresh parse
-        projectRepository.findByGithubUrlAndUserId(githuburl,user.getId())
-                .ifPresent(existing->{
-                    log.info("Re-analyzing existing project:{}",existing.getId());
+        // Delete existing project if it exists
+        projectRepository.findByGithubUrlAndUserId(githuburl, user.getId())
+                .ifPresent(existing -> {
+                    log.info("Re-analyzing existing project: {}", existing.getId());
                     astNodeRepository.deleteByProjectId(existing.getId());
                     projectRepository.delete(existing);
                 });
 
-//        if project not exist then now build the project
-        String repoName=extractRepoName(githuburl);
-        Project project=Project.builder()
+        String repoName = extractRepoName(githuburl);
+        Project project = Project.builder()
                 .githubUrl(githuburl)
                 .repoName(repoName)
                 .user(user)
                 .status(Project.ProjectStatus.PROCESSING)
                 .build();
-//      saving the project
-        project=projectRepository.save(project);
-        log.info("Project saved with id:{}",project.getId());
 
-// cloning the repo into a temp directory
-        Path tempDir=null;
-        try{
-            tempDir=cloneRepo(githuburl);
+        project = projectRepository.save(project);
+        log.info("Project created with id: {}", project.getId());
 
-//            Now we need to detect stack and build the map acordingly
-            Map<StackType,Path> detectedStacks=detectAllStacks(tempDir);
-            log.info("Detected Stacks:{} ",detectedStacks.keySet());
+        Path tempDir = null;
+        long startTime = System.currentTimeMillis();
+        try {
+            tempDir = cloneRepo(githuburl);
+            log.info("Repository cloned to: {} (took {}ms)", tempDir, System.currentTimeMillis() - startTime);
 
-            if(detectedStacks.isEmpty()){
+            long stackDetectStart = System.currentTimeMillis();
+            Map<StackType, Path> detectedStacks = detectAllStacks(tempDir);
+            log.info("Detected Stacks: {} (took {}ms)", detectedStacks.keySet(), System.currentTimeMillis() - stackDetectStart);
+
+            if (detectedStacks.isEmpty()) {
                 project.setDetectedStack("UNKNOWN");
                 project.setStatus(Project.ProjectStatus.COMPLETED);
                 projectRepository.save(project);
                 return buildResponse(project, new ArrayList<>());
             }
 
-//            parsing nodes for each detected stack
-            List<AstNode>allNodes=new ArrayList<>();
-            for(Map.Entry<StackType, Path> entry:detectedStacks.entrySet()){
-                StackType stack=entry.getKey();
-                Path stackRoot=entry.getValue();
+            // Parse all files in parallel
+            long parseStart = System.currentTimeMillis();
+            List<AstNode> allNodes = parseWithTreeSitterOptimized(tempDir, project);
+            log.info("Parsed {} nodes total (took {}ms)", allNodes.size(), System.currentTimeMillis() - parseStart);
 
-                List<AstNode> stackNodes = switch (stack) {
-                    case SPRING_BOOT -> parseSpringBootNodes(stackRoot, project);
-                    case NODE_EXPRESS -> parseNodeExpressNodes(stackRoot, project);
-                    case DJANGO -> parseDjangoNodes(stackRoot, project);
-                    default -> new ArrayList<>();
-                };
+            List<AstNode> savedNodes = astNodeRepository.saveAll(allNodes);
+            log.info("Saved {} nodes for project {}", savedNodes.size(), project.getId());
 
-                allNodes.addAll(stackNodes);
-
-            }
-
-            astNodeRepository.saveAll(allNodes);
-            log.info("Saved {} nodes for project {}", allNodes.size(), project.getId());
-
-            // Step 9 — Mark project as COMPLETED
             project.setDetectedStack(String.join(",", detectedStacks.keySet()
                     .stream()
                     .map(StackType::name)
@@ -118,159 +153,187 @@ public class ProjectParserService {
             project.setStatus(Project.ProjectStatus.COMPLETED);
             project = projectRepository.save(project);
 
-            // Step 10 — Build and return response for React frontend
-            return buildResponse(project, allNodes);
+            log.info("Total parsing time: {}ms", System.currentTimeMillis() - startTime);
+            return buildResponse(project, savedNodes);
         } catch (Exception e) {
-            // Mark project as FAILED if anything goes wrong
-            project.setStatus(Project.ProjectStatus.FAILED);
-            projectRepository.save(project);
-            log.error("Parsing failed for {}: {}", githuburl, e.getMessage());
+            if (project != null && project.getId() != null) {
+                project.setStatus(Project.ProjectStatus.FAILED);
+                projectRepository.save(project);
+            }
+            log.error("Parsing failed for {}: {}", githuburl, e.getMessage(), e);
             throw new RuntimeException("Failed to parse project: " + e.getMessage(), e);
-        }finally {
-            // Always clean up temp cloned repo from disk
+        } finally {
             if (tempDir != null) {
                 try {
                     forceDeleteDirectory(tempDir);
-                } catch (IOException ex) {
+                } catch (Exception ex) {
                     log.warn("Could not fully clean temp dir {}: {}", tempDir, ex.getMessage());
                 }
             }
         }
     }
-    private void forceDeleteDirectory(Path dir) throws IOException {
-        if (!Files.exists(dir)) return;
 
-        // Make all files writable before deletion (fixes Windows .git lock issues)
-        Files.walk(dir)
-                .sorted(java.util.Comparator.reverseOrder()) // delete children before parents
-                .forEach(path -> {
-                    try {
-                        path.toFile().setWritable(true);
-                        Files.delete(path);
-                    } catch (IOException e) {
-                        log.debug("Could not delete {}: {}", path, e.getMessage());
+    private List<AstNode> parseWithTreeSitterOptimized(Path repoRoot, Project project) {
+        List<AstNode> allNodes = Collections.synchronizedList(new ArrayList<>());
+        List<Path> validFiles = new ArrayList<>();
+
+        // Step 1: Collect all valid files
+        long fileCollectionStart = System.currentTimeMillis();
+        try {
+            Files.walkFileTree(repoRoot, new SimpleFileVisitor<Path>() {
+                @Override
+                public FileVisitResult preVisitDirectory(Path dir, BasicFileAttributes attrs) {
+                    String dirName = dir.getFileName().toString();
+                    if (SKIP_DIRS.contains(dirName) || dirName.startsWith(".")) {
+                        return FileVisitResult.SKIP_SUBTREE;
                     }
-                });
-    }
+                    return FileVisitResult.CONTINUE;
+                }
 
-    private List<AstNode> parseSpringBootNodes(Path repoRoot, Project project) throws IOException {
-        List<AstNode> nodes = new ArrayList<>();
-
-        // Walk all .java files in the repo
-        try (Stream<Path> javaFiles = Files.walk(repoRoot)
-                .filter(p -> p.toString().endsWith(".java"))) {
-
-            javaFiles.forEach(javaFile -> {
-                try {
-                    CompilationUnit cu = StaticJavaParser.parse(javaFile);
-
-                    // Visit every class in the file
-                    cu.findAll(ClassOrInterfaceDeclaration.class).forEach(classDecl -> {
-
-                        String nodeType = detectNodeType(classDecl);
-                        String relativePath = repoRoot.relativize(javaFile).toString();
-
-                        // Create a node for the class itself
-                        AstNode classNode = AstNode.builder()
-                                .nodeType(nodeType)
-                                .label(classDecl.getNameAsString())
-                                .filePath(relativePath)
-                                .rawCode(classDecl.toString())
-                                .project(project)
-                                .build();
-                        nodes.add(classNode);
-
-                        // For controllers: also extract each endpoint as its own node
-                        if (nodeType.equals("API_ENDPOINT")) {
-                            classDecl.findAll(MethodDeclaration.class).forEach(method -> {
-                                boolean isEndpoint = method.getAnnotations().stream()
-                                        .map(AnnotationExpr::getNameAsString)
-                                        .anyMatch(a -> a.matches("GetMapping|PostMapping|PutMapping|DeleteMapping|RequestMapping"));
-
-                                if (isEndpoint) {
-                                    AstNode methodNode = AstNode.builder()
-                                            .nodeType("API_ENDPOINT")
-                                            .label(classDecl.getNameAsString() + "#" + method.getNameAsString())
-                                            .filePath(relativePath)
-                                            .rawCode(method.toString())
-                                            .project(project)
-                                            .build();
-                                    nodes.add(methodNode);
-                                }
-                            });
-                        }
-                    });
-
-                } catch (Exception e) {
-                    // Skip unparseable files — don't crash the whole analysis
-                    log.warn("Could not parse file {}: {}", javaFile.getFileName(), e.getMessage());
+                @Override
+                public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) {
+                    validFiles.add(file);
+                    return FileVisitResult.CONTINUE;
                 }
             });
+        } catch (IOException e) {
+            log.error("Failed to walk repo root: {}", e.getMessage());
+            return allNodes;
         }
 
-        return nodes;
-    }
+        log.info("Found {} files to process (took {}ms)", validFiles.size(),
+                System.currentTimeMillis() - fileCollectionStart);
 
-    private List<AstNode> parseNodeExpressNodes(Path repoRoot, Project project) throws IOException {
-        List<AstNode> nodes = new ArrayList<>();
+        // Step 2: Read files asynchronously using ForkJoinPool
+        long fileReadStart = System.currentTimeMillis();
+        List<Map<String, Object>> fileBatch = validFiles.parallelStream()
+                .map(file -> {
+                    try {
+                        long fileSize = Files.size(file);
+                        if (fileSize > MAX_FILE_SIZE) return null;
 
-        log.info("Node/Express parsing not yet implemented");
-        // TODO: Implement JavaScript/TypeScript parsing
-        // You could use Nashorn, GraalVM, or a JavaScript parser library
+                        String fileName = file.getFileName().toString();
+                        int dotIndex = fileName.lastIndexOf('.');
+                        if (dotIndex <= 0 || dotIndex == fileName.length() - 1) return null;
 
-        return nodes;
-    }
+                        String extension = fileName.substring(dotIndex + 1);
+                        if (!SUPPORTED_EXTENSIONS.contains(extension)) return null;
 
-    // ─────────────────────────────────────────────
-    // STEP 7c — PARSE DJANGO NODES (Placeholder)
-    // ─────────────────────────────────────────────
+                        String code = Files.readString(file);
+                        String relativePath = repoRoot.relativize(file).toString().replace("\\", "/");
 
-    private List<AstNode> parseDjangoNodes(Path repoRoot, Project project) throws IOException {
-        List<AstNode> nodes = new ArrayList<>();
-
-        log.info("Django parsing not yet implemented");
-        // TODO: Implement Python parsing
-        // You could use Jython or a Python AST parser library
-
-        return nodes;
-    }
-
-    private String detectNodeType(ClassOrInterfaceDeclaration classDecl) {
-        List<String> annotations = classDecl.getAnnotations()
-                .stream()
-                .map(AnnotationExpr::getNameAsString)
+                        Map<String, Object> fileData = new HashMap<>();
+                        fileData.put("filePath", relativePath);
+                        fileData.put("code", code);
+                        fileData.put("extension", extension);
+                        return fileData;
+                    } catch (Exception e) {
+                        log.debug("Failed to read file {}: {}", file, e.getMessage());
+                        return null;
+                    }
+                })
+                .filter(Objects::nonNull)
                 .toList();
 
-        if (annotations.contains("RestController") || annotations.contains("Controller")) {
-            return "API_ENDPOINT";
+        log.info("Successfully read {} files (took {}ms)", fileBatch.size(),
+                System.currentTimeMillis() - fileReadStart);
+
+        // Step 3: Batch HTTP requests in parallel
+        long httpStart = System.currentTimeMillis();
+        List<CompletableFuture<Void>> httpFutures = new ArrayList<>();
+        int numBatches = (int) Math.ceil((double) fileBatch.size() / BATCH_SIZE);
+
+        for (int i = 0; i < numBatches; i++) {
+            final int batchIndex = i;
+            CompletableFuture<Void> httpFuture = CompletableFuture.runAsync(() -> {
+                int start = batchIndex * BATCH_SIZE;
+                int end = Math.min(start + BATCH_SIZE, fileBatch.size());
+                List<Map<String, Object>> chunk = new ArrayList<>(fileBatch.subList(start, end));
+
+                try {
+                    Map<String, Object> requestBody = new HashMap<>();
+                    requestBody.put("files", chunk);
+                    HttpEntity<Map<String, Object>> requestEntity = new HttpEntity<>(requestBody, new HttpHeaders());
+
+                    Map<String, Object> response = restTemplate.postForObject(
+                            "http://localhost:3001/parse-batch",
+                            requestEntity,
+                            Map.class
+                    );
+
+                    if (response != null && response.containsKey("results")) {
+                        List<Map<String, Object>> results = (List<Map<String, Object>>) response.get("results");
+
+                        for (Map<String, Object> fileResult : results) {
+                            String filePath = (String) fileResult.get("filePath");
+                            List<Map<String, Object>> nodes = (List<Map<String, Object>>) fileResult.get("nodes");
+
+                            if (nodes != null) {
+                                for (Map<String, Object> node : nodes) {
+                                    AstNode astNode = AstNode.builder()
+                                            .nodeType((String) node.get("nodeType"))
+                                            .label((String) node.get("label"))
+                                            .filePath(filePath)
+                                            .rawCode((String) node.get("rawCode"))
+                                            .project(project)
+                                            .build();
+                                    allNodes.add(astNode);
+                                }
+                            }
+                        }
+                    }
+                    log.debug("Batch {} completed: {} files", batchIndex, chunk.size());
+                } catch (Exception e) {
+                    log.error("Batch {} request failed: {}", batchIndex, e.getMessage());
+                }
+            }, httpExecutor);
+
+            httpFutures.add(httpFuture);
         }
-        if (annotations.contains("Service")) {
-            return "SERVICE";
+
+        // Wait for all HTTP requests to complete
+        CompletableFuture<Void> allHttpRequests = CompletableFuture.allOf(
+                httpFutures.toArray(new CompletableFuture[0])
+        );
+
+        try {
+            allHttpRequests.get(5, TimeUnit.MINUTES);
+        } catch (TimeoutException e) {
+            log.error("HTTP requests timeout after 5 minutes");
+        } catch (Exception e) {
+            log.error("HTTP requests failed: {}", e.getMessage());
         }
-        if (annotations.contains("Repository")) {
-            return "REPOSITORY";
-        }
-        if (annotations.contains("Component")) {
-            return "COMPONENT";
-        }
-        if (annotations.contains("Configuration")) {
-            return "CONFIG";
-        }
-        if (annotations.contains("Entity")) {
-            return "ENTITY";
-        }
-        return "CLASS";
+
+        log.info("HTTP batch requests completed (took {}ms)", System.currentTimeMillis() - httpStart);
+        return allNodes;
     }
 
-    private ParseResponse buildResponse(Project project, List<AstNode>nodes){
-        List<NodeDTO> nodeDTOs=nodes.stream()
-                .map(node->NodeDTO.builder()
+    private void forceDeleteDirectory(Path dir) {
+        if (!Files.exists(dir)) return;
+
+        try (Stream<Path> walk = Files.walk(dir)) {
+            walk.sorted(java.util.Comparator.reverseOrder())
+                    .forEach(path -> {
+                        try {
+                            path.toFile().setWritable(true);
+                            Files.delete(path);
+                        } catch (Exception e) {
+                            log.debug("Could not delete {}: {}", path, e.getMessage());
+                        }
+                    });
+        } catch (Exception e) {
+            log.debug("Failed during directory walk deletion: {}", e.getMessage());
+        }
+    }
+
+    private ParseResponse buildResponse(Project project, List<AstNode> nodes) {
+        List<NodeDTO> nodeDTOs = nodes.stream()
+                .map(node -> NodeDTO.builder()
                         .id(node.getId())
                         .label(node.getLabel())
                         .nodeType(node.getNodeType())
                         .filePath(node.getFilePath())
                         .dependancies(new ArrayList<>())
-
                         .build()
                 ).toList();
 
@@ -283,90 +346,84 @@ public class ProjectParserService {
                 .build();
     }
 
-    private User getAuthenticatedUser(){
-        Authentication authentication=SecurityContextHolder.getContext().getAuthentication();
+    private User getAuthenticatedUser() {
+        Authentication authentication = SecurityContextHolder.getContext().getAuthentication();
         String supabaseId = (String) authentication.getPrincipal();
 
-        return userRepository.findBySupabaseId(supabaseId).orElseThrow(()->new RuntimeException("User Not found in DB for supabaseId"));
+        return userRepository.findBySupabaseId(supabaseId)
+                .orElseThrow(() -> new RuntimeException("User not found for supabaseId: " + supabaseId));
     }
 
-    private void validateGithubUrl(String url){
-        if(url==null || url.isBlank()){
+    private void validateGithubUrl(String url) {
+        if (url == null || url.isBlank()) {
             throw new IllegalArgumentException("GitHub URL cannot be empty");
-
         }
         if (!url.startsWith("https://github.com/")) {
             throw new IllegalArgumentException("URL must be a public GitHub URL (https://github.com/...)");
         }
     }
 
-    private String extractRepoName(String githubUrl){
-        String[] parts=githubUrl.split("/");
-        return parts[parts.length-1].replace(".git","");
+    private String extractRepoName(String githubUrl) {
+        String[] parts = githubUrl.split("/");
+        return parts[parts.length - 1].replace(".git", "");
     }
 
-    private Path cloneRepo(String githuburl) throws Exception{
-        Path tempDir= Files.createTempDirectory("codelens-");
-        log.info("Cloning {} into {}",githuburl,tempDir);
+    private Path cloneRepo(String githuburl) throws Exception {
+        Path tempDir = Files.createTempDirectory("codelens-");
+        log.info("Cloning {} into {}", githuburl, tempDir);
 
         Git.cloneRepository()
                 .setURI(githuburl)
                 .setDirectory(tempDir.toFile())
                 .setDepth(1)
                 .setNoTags()
+                .setCloneAllBranches(false)
                 .call()
                 .close();
 
         return tempDir;
     }
 
-    private Map<StackType,Path> detectAllStacks(Path repoRoot) throws IOException{
-        Map<StackType,Path>detectedStacks=new HashMap<>();
+    private Map<StackType, Path> detectAllStacks(Path repoRoot) throws IOException {
+        Map<StackType, Path> detectedStacks = Collections.synchronizedMap(new HashMap<>());
+
         try (Stream<Path> paths = Files.walk(repoRoot, 3)) {
             paths.filter(Files::isRegularFile)
+                    .parallel()
                     .forEach(filePath -> {
                         try {
                             String fileName = filePath.getFileName().toString();
                             StackType stack = detectStackByFileName(fileName);
 
                             if (stack != StackType.UNKNOWN) {
-                                // Find the most relevant root directory for this stack
                                 Path stackRoot = findStackRootDirectory(filePath, repoRoot, stack);
-
-                                // Only add if we haven't already detected this stack
-                                // (or if this is a better/closer match)
                                 detectedStacks.putIfAbsent(stack, stackRoot);
                                 log.info("Detected {} in {}", stack, stackRoot);
                             }
                         } catch (Exception e) {
-                            // Log but don't fail — just continue scanning
                             log.debug("Error checking file {}: {}", filePath, e.getMessage());
                         }
                     });
         }
 
         return detectedStacks;
-
     }
 
     private Path findStackRootDirectory(Path filePath, Path repoRoot, StackType stackType) {
         Path parent = filePath.getParent();
         String fileName = filePath.getFileName().toString();
 
-        // Special handling for package.json — it's often in a subfolder (frontend, ui, etc.)
         if (stackType == StackType.NODE_EXPRESS && fileName.equals("package.json")) {
-            // Check if this is a frontend package.json by looking for common frontend markers
             try {
                 String content = Files.readString(filePath);
                 if (content.contains("react") || content.contains("vue") || content.contains("angular")) {
-                    return parent;  // This is the frontend root
+                    return parent;
                 }
             } catch (IOException e) {
                 log.debug("Could not read package.json content");
             }
         }
 
-        // For other stacks, the parent directory is typically the root
         return parent != null ? parent : repoRoot;
     }
 
@@ -391,6 +448,4 @@ public class ProjectParserService {
         RUST,
         UNKNOWN
     }
-
-
 }
