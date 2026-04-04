@@ -49,7 +49,7 @@ public class ProjectParserService {
     );
 
     private static final Set<String> SUPPORTED_EXTENSIONS = Set.of(
-            "js", "jsx", "ts", "tsx", "py", "java", "go", "rs", "rb", "cs", "cpp", "c", "php"
+            "js", "jsx", "ts", "tsx", "py", "java", "go", "rs", "rb", "cs", "cpp", "c", "php", "vue"
     );
 
     private final ExecutorService fileReaderExecutor;
@@ -66,9 +66,7 @@ public class ProjectParserService {
     private AstNodeRepository astNodeRepository;
 
     public ProjectParserService() {
-        // Java 17: Use ForkJoinPool for parallel file reading
         this.fileReaderExecutor = new ForkJoinPool(THREAD_POOL_SIZE);
-        // Limited thread pool for HTTP requests
         this.httpExecutor = Executors.newFixedThreadPool(Math.min(4, THREAD_POOL_SIZE));
         this.restTemplate = createRestTemplate();
     }
@@ -102,7 +100,6 @@ public class ProjectParserService {
 
         User user = getAuthenticatedUser();
 
-        // Delete existing project if it exists
         projectRepository.findByGithubUrlAndUserId(githuburl, user.getId())
                 .ifPresent(existing -> {
                     log.info("Re-analyzing existing project: {}", existing.getId());
@@ -138,10 +135,15 @@ public class ProjectParserService {
                 return buildResponse(project, new ArrayList<>());
             }
 
+            // ===== NEW: Pass detected framework to parser =====
+            StackType primaryFramework = detectedStacks.keySet().iterator().next();
+            String frameworkName = stackTypeToFrameworkName(primaryFramework);
+
             // Parse all files in parallel
             long parseStart = System.currentTimeMillis();
-            List<AstNode> allNodes = parseWithTreeSitterOptimized(tempDir, project);
-            log.info("Parsed {} nodes total (took {}ms)", allNodes.size(), System.currentTimeMillis() - parseStart);
+            List<AstNode> allNodes = parseWithTreeSitterOptimized(tempDir, project, frameworkName);
+            log.info("Parsed {} nodes total (took {}ms) for framework: {}",
+                    allNodes.size(), System.currentTimeMillis() - parseStart, frameworkName);
 
             List<AstNode> savedNodes = astNodeRepository.saveAll(allNodes);
             log.info("Saved {} nodes for project {}", savedNodes.size(), project.getId());
@@ -173,11 +175,12 @@ public class ProjectParserService {
         }
     }
 
-    private List<AstNode> parseWithTreeSitterOptimized(Path repoRoot, Project project) {
+
+
+    private List<AstNode> parseWithTreeSitterOptimized(Path repoRoot, Project project, String frameworkName) {
         List<AstNode> allNodes = Collections.synchronizedList(new ArrayList<>());
         List<Path> validFiles = new ArrayList<>();
 
-        // Step 1: Collect all valid files
         long fileCollectionStart = System.currentTimeMillis();
         try {
             Files.walkFileTree(repoRoot, new SimpleFileVisitor<Path>() {
@@ -192,77 +195,78 @@ public class ProjectParserService {
 
                 @Override
                 public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) {
-                    validFiles.add(file);
+                    String fileName = file.getFileName().toString();
+                    String ext = fileName.contains(".") ? fileName.substring(fileName.lastIndexOf(".") + 1) : "";
+
+                    if (SUPPORTED_EXTENSIONS.contains(ext) && attrs.size() <= MAX_FILE_SIZE) {
+                        validFiles.add(file);
+                    }
                     return FileVisitResult.CONTINUE;
                 }
             });
-        } catch (IOException e) {
-            log.error("Failed to walk repo root: {}", e.getMessage());
+
+            log.info("Found {} valid files in {} (took {}ms)",
+                    validFiles.size(), repoRoot, System.currentTimeMillis() - fileCollectionStart);
+        } catch (Exception e) {
+            log.error("Error walking file tree: {}", e.getMessage());
             return allNodes;
         }
 
-        log.info("Found {} files to process (took {}ms)", validFiles.size(),
-                System.currentTimeMillis() - fileCollectionStart);
+        if (validFiles.isEmpty()) {
+            log.warn("No valid files found in {}", repoRoot);
+            return allNodes;
+        }
 
-        // Step 2: Read files asynchronously using ForkJoinPool
-        long fileReadStart = System.currentTimeMillis();
-        List<Map<String, Object>> fileBatch = validFiles.parallelStream()
-                .map(file -> {
-                    try {
-                        long fileSize = Files.size(file);
-                        if (fileSize > MAX_FILE_SIZE) return null;
-
-                        String fileName = file.getFileName().toString();
-                        int dotIndex = fileName.lastIndexOf('.');
-                        if (dotIndex <= 0 || dotIndex == fileName.length() - 1) return null;
-
-                        String extension = fileName.substring(dotIndex + 1);
-                        if (!SUPPORTED_EXTENSIONS.contains(extension)) return null;
-
-                        String code = Files.readString(file);
-                        String relativePath = repoRoot.relativize(file).toString().replace("\\", "/");
-
-                        Map<String, Object> fileData = new HashMap<>();
-                        fileData.put("filePath", relativePath);
-                        fileData.put("code", code);
-                        fileData.put("extension", extension);
-                        return fileData;
-                    } catch (Exception e) {
-                        log.debug("Failed to read file {}: {}", file, e.getMessage());
-                        return null;
-                    }
-                })
-                .filter(Objects::nonNull)
-                .toList();
-
-        log.info("Successfully read {} files (took {}ms)", fileBatch.size(),
-                System.currentTimeMillis() - fileReadStart);
-
-        // Step 3: Batch HTTP requests in parallel
         long httpStart = System.currentTimeMillis();
+        List<Map<String, Object>> batchRequests = new ArrayList<>();
+
+        // Convert files to batch request format
+        for (Path filePath : validFiles) {
+            try {
+                String code = Files.readString(filePath);
+                String relativePath = repoRoot.relativize(filePath).toString();
+                String ext = filePath.getFileName().toString()
+                        .substring(filePath.getFileName().toString().lastIndexOf(".") + 1);
+
+                batchRequests.add(Map.of(
+                        "filePath", relativePath,
+                        "code", code,
+                        "extension", ext
+                ));
+            } catch (Exception e) {
+                log.debug("Error reading file {}: {}", filePath, e.getMessage());
+            }
+        }
+
+        // Split into batches
         List<CompletableFuture<Void>> httpFutures = new ArrayList<>();
-        int numBatches = (int) Math.ceil((double) fileBatch.size() / BATCH_SIZE);
+        for (int i = 0; i < batchRequests.size(); i += BATCH_SIZE) {
+            int endIdx = Math.min(i + BATCH_SIZE, batchRequests.size());
+            List<Map<String, Object>> chunk = batchRequests.subList(i, endIdx);
+            int batchIndex = i / BATCH_SIZE;
 
-        for (int i = 0; i < numBatches; i++) {
-            final int batchIndex = i;
             CompletableFuture<Void> httpFuture = CompletableFuture.runAsync(() -> {
-                int start = batchIndex * BATCH_SIZE;
-                int end = Math.min(start + BATCH_SIZE, fileBatch.size());
-                List<Map<String, Object>> chunk = new ArrayList<>(fileBatch.subList(start, end));
-
                 try {
+                    HttpHeaders headers = new HttpHeaders();
+                    headers.setContentType(MediaType.APPLICATION_JSON);
+
+                    // ===== NEW: Include framework in request =====
                     Map<String, Object> requestBody = new HashMap<>();
                     requestBody.put("files", chunk);
-                    HttpEntity<Map<String, Object>> requestEntity = new HttpEntity<>(requestBody, new HttpHeaders());
+                    requestBody.put("framework", frameworkName);
 
-                    Map<String, Object> response = restTemplate.postForObject(
-                            "http://localhost:3001/parse-batch",
-                            requestEntity,
+                    HttpEntity<Map<String, Object>> request = new HttpEntity<>(requestBody, headers);
+
+                    ResponseEntity<Map> response = restTemplate.postForEntity(
+                            "http://localhost:3001/parseBatch",
+                            request,
                             Map.class
                     );
 
-                    if (response != null && response.containsKey("results")) {
-                        List<Map<String, Object>> results = (List<Map<String, Object>>) response.get("results");
+                    Map responseBody = response.getBody();
+
+                    if (responseBody != null && responseBody.containsKey("results")) {
+                        List<Map<String, Object>> results = (List<Map<String, Object>>) responseBody.get("results");
 
                         for (Map<String, Object> fileResult : results) {
                             String filePath = (String) fileResult.get("filePath");
@@ -291,7 +295,6 @@ public class ProjectParserService {
             httpFutures.add(httpFuture);
         }
 
-        // Wait for all HTTP requests to complete
         CompletableFuture<Void> allHttpRequests = CompletableFuture.allOf(
                 httpFutures.toArray(new CompletableFuture[0])
         );
@@ -396,7 +399,10 @@ public class ProjectParserService {
                             StackType stack = detectStackByFileName(fileName);
 
                             if (stack != StackType.UNKNOWN) {
-                                Path stackRoot = findStackRootDirectory(filePath, repoRoot, stack);
+                                // NEW: Look inside the file to refine the exact framework
+                                stack = refineStackType(filePath, stack);
+
+                                Path stackRoot = filePath.getParent() != null ? filePath.getParent() : repoRoot;
                                 detectedStacks.putIfAbsent(stack, stackRoot);
                                 log.info("Detected {} in {}", stack, stackRoot);
                             }
@@ -405,9 +411,28 @@ public class ProjectParserService {
                         }
                     });
         }
-
         return detectedStacks;
     }
+
+    // NEW: Reads package.json and requirements.txt to differentiate JS/Python frameworks
+    private StackType refineStackType(Path filePath, StackType currentStack) {
+        String fileName = filePath.getFileName().toString();
+        try {
+            if (currentStack == StackType.NODE_EXPRESS && fileName.equals("package.json")) {
+                String content = Files.readString(filePath).toLowerCase();
+                if (content.contains("\"next\"") || content.contains("\"react\"")) return StackType.REACT_NEXT;
+                if (content.contains("\"vue\"") || content.contains("\"nuxt\"")) return StackType.VUE;
+                if (content.contains("\"@angular/core\"")) return StackType.ANGULAR;
+            } else if (currentStack == StackType.DJANGO && (fileName.equals("requirements.txt") || fileName.equals("pyproject.toml"))) {
+                String content = Files.readString(filePath).toLowerCase();
+                if (content.contains("flask")) return StackType.FLASK;
+            }
+        } catch (IOException e) {
+            log.debug("Could not read file for stack refinement");
+        }
+        return currentStack;
+    }
+
 
     private Path findStackRootDirectory(Path filePath, Path repoRoot, StackType stackType) {
         Path parent = filePath.getParent();
@@ -428,24 +453,26 @@ public class ProjectParserService {
     }
 
     private StackType detectStackByFileName(String fileName) {
+        if (fileName.endsWith(".csproj")) return StackType.ASP_NET;
+
         return switch (fileName) {
-            case "pom.xml" -> StackType.SPRING_BOOT;
+            case "pom.xml", "build.gradle" -> StackType.SPRING_BOOT;
             case "package.json" -> StackType.NODE_EXPRESS;
-            case "requirements.txt" -> StackType.DJANGO;
+            case "requirements.txt", "Pipfile", "pyproject.toml" -> StackType.DJANGO;
             case "Gemfile" -> StackType.RUBY_RAILS;
-            case "go.mod" -> StackType.GO;
-            case "Cargo.toml" -> StackType.RUST;
+            case "artisan", "composer.json" -> StackType.LARAVEL;
+            case "angular.json" -> StackType.ANGULAR;
             default -> StackType.UNKNOWN;
         };
     }
 
+    // 2. Updated String Mapper
+    private String stackTypeToFrameworkName(StackType stackType) {
+        return stackType.name(); // Since the enum names now match the Node config exactly
+    }
+
     private enum StackType {
-        SPRING_BOOT,
-        NODE_EXPRESS,
-        DJANGO,
-        RUBY_RAILS,
-        GO,
-        RUST,
-        UNKNOWN
+        SPRING_BOOT, NODE_EXPRESS, REACT_NEXT, ANGULAR, VUE,
+        DJANGO, FLASK, RUBY_RAILS, LARAVEL, ASP_NET, UNKNOWN
     }
 }
