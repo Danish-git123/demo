@@ -98,9 +98,12 @@ public class ProjectParserService {
         String githuburl = request.getGithuburl();
         validateGithubUrl(githuburl);
 
+        String baseRepoUrl=extractBaseRepoUrl(githuburl);
+        String subFolderPath=extractFolderPath(githuburl);
+
         User user = getAuthenticatedUser();
 
-        projectRepository.findByGithubUrlAndUserId(githuburl, user.getId())
+        projectRepository.findByGithubUrlAndUserId(baseRepoUrl, user.getId())
                 .ifPresent(existing -> {
                     log.info("Re-analyzing existing project: {}", existing.getId());
                     astNodeRepository.deleteByProjectId(existing.getId());
@@ -121,7 +124,12 @@ public class ProjectParserService {
         Path tempDir = null;
         long startTime = System.currentTimeMillis();
         try {
-            tempDir = cloneRepo(githuburl);
+            tempDir = cloneRepo(baseRepoUrl);
+            Path processingPath=tempDir.resolve(subFolderPath);
+
+            if (!Files.exists(processingPath)) {
+                throw new RuntimeException("Directory path not found in repository: " + subFolderPath);
+            }
             log.info("Repository cloned to: {} (took {}ms)", tempDir, System.currentTimeMillis() - startTime);
 
             long stackDetectStart = System.currentTimeMillis();
@@ -141,12 +149,18 @@ public class ProjectParserService {
 
             // Parse all files in parallel
             long parseStart = System.currentTimeMillis();
-            List<AstNode> allNodes = parseWithTreeSitterOptimized(tempDir, project, frameworkName);
+            List<AstNode> allNodes = parseWithTreeSitterOptimized(processingPath, project, frameworkName);
             log.info("Parsed {} nodes total (took {}ms) for framework: {}",
                     allNodes.size(), System.currentTimeMillis() - parseStart, frameworkName);
 
             List<AstNode> savedNodes = astNodeRepository.saveAll(allNodes);
             log.info("Saved {} nodes for project {}", savedNodes.size(), project.getId());
+
+            // ===== NEW: Process cross-node dependencies =====
+            long depStart = System.currentTimeMillis();
+            processNodeDependencies(savedNodes);
+            savedNodes = astNodeRepository.saveAll(savedNodes);
+            log.info("Processed dependencies (took {}ms)", System.currentTimeMillis() - depStart);
 
             project.setDetectedStack(String.join(",", detectedStacks.keySet()
                     .stream()
@@ -331,14 +345,22 @@ public class ProjectParserService {
 
     private ParseResponse buildResponse(Project project, List<AstNode> nodes) {
         List<NodeDTO> nodeDTOs = nodes.stream()
-                .map(node -> NodeDTO.builder()
+                .map(node -> {
+                    List<String> deps = new ArrayList<>();
+                    if (node.getDependencies() != null && node.getDependencies().length() > 2) {
+                        String clean = node.getDependencies().replace("[", "").replace("]", "").replace("\"", "");
+                        for(String d : clean.split(",")) {
+                            if(!d.isBlank()) deps.add(d.trim());
+                        }
+                    }
+                    return NodeDTO.builder()
                         .id(node.getId())
                         .label(node.getLabel())
                         .nodeType(node.getNodeType())
                         .filePath(node.getFilePath())
-                        .dependancies(new ArrayList<>())
-                        .build()
-                ).toList();
+                        .dependancies(deps)
+                        .build();
+                }).toList();
 
         return ParseResponse.builder()
                 .projectId(project.getId())
@@ -355,6 +377,67 @@ public class ProjectParserService {
 
         return userRepository.findBySupabaseId(supabaseId)
                 .orElseThrow(() -> new RuntimeException("User not found for supabaseId: " + supabaseId));
+    }
+
+    private void processNodeDependencies(List<AstNode> nodes) {
+        // Compile patterns for all valid targets to speed up search
+        Map<String, java.util.regex.Pattern> targetPatterns = new HashMap<>();
+        for (AstNode target : nodes) {
+            String label = target.getLabel();
+            // Skip very short or overly common labels to prevent massive collision graphs
+            if (label == null || label.length() < 4) continue;
+            // E.g., 'main', 'index', 'app' are too common to establish strict module lines
+            if (label.equalsIgnoreCase("main") || label.equalsIgnoreCase("index") || label.equalsIgnoreCase("app")) continue;
+
+            String regex = "(?i)\\b" + java.util.regex.Pattern.quote(label) + "\\b";
+            targetPatterns.put(target.getId().toString(), java.util.regex.Pattern.compile(regex));
+        }
+
+        for (AstNode node : nodes) {
+            String rawCode = node.getRawCode();
+            if (rawCode == null || rawCode.isBlank()) continue;
+
+            List<String> foundDeps = new ArrayList<>();
+            for (Map.Entry<String, java.util.regex.Pattern> entry : targetPatterns.entrySet()) {
+                String targetId = entry.getKey();
+                if (targetId.equals(node.getId().toString())) continue;
+
+                if (entry.getValue().matcher(rawCode).find()) {
+                    foundDeps.add(targetId);
+                }
+            }
+
+            // Manually serialize array to avoid heavy mapper dependencies
+            StringBuilder sb = new StringBuilder("[");
+            for (int i = 0; i < foundDeps.size(); i++) {
+                if (i > 0) sb.append(",");
+                sb.append("\"").append(foundDeps.get(i)).append("\"");
+            }
+            sb.append("]");
+            node.setDependencies(sb.toString());
+        }
+    }
+
+    private String extractBaseRepoUrl(String githubUrl) {
+        // If URL contains "/tree/main/", get everything before it
+        if (githubUrl.contains("/tree/")) {
+            return githubUrl.substring(0, githubUrl.indexOf("/tree/"));
+        }
+        return githubUrl;
+    }
+
+//    to extract the subfolders too
+    private String extractFolderPath(String githubUrl) {
+        // Input: https://github.com/user/repo/tree/main/backend
+        // Output: "backend"
+        if (githubUrl.contains("/tree/")) {
+            String pathAfterTree = githubUrl.split("/tree/")[1]; // "main/backend"
+            int firstSlash = pathAfterTree.indexOf("/");
+            if (firstSlash != -1 && firstSlash < pathAfterTree.length() - 1) {
+                return pathAfterTree.substring(firstSlash + 1);
+            }
+        }
+        return ""; // Root directory
     }
 
     private void validateGithubUrl(String url) {

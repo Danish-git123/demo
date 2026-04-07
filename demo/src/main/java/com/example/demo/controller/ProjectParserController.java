@@ -9,15 +9,17 @@ import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
+import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 
 @RestController
 @Slf4j
+@RequestMapping("/parse")
 public class ProjectParserController {
     @Autowired
     private ProjectParserService projectParserService;
 
-    @PostMapping("/parse")
+    @PostMapping
     public ResponseEntity<ParseResponse> parseProject(@RequestBody ParseRequest request) {
         try {
             log.info("Received parse request for URL: {}", request.getGithuburl());
