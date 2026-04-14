@@ -1,6 +1,7 @@
 package com.example.demo.repository;
 
 import com.example.demo.entity.AstNode;
+import org.aspectj.weaver.ast.ASTNode;
 import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
@@ -25,4 +26,28 @@ public interface AstNodeRepository extends JpaRepository<AstNode, UUID> {
 
     // Delete all nodes for a project (when re-analyzing)
     void deleteByProjectId(UUID projectId);
+
+    // Find nodes that reference a specific class name — for dependency resolution
+    @Query("""
+        SELECT n FROM ASTNode n
+        WHERE n.repoUrl = :repoUrl
+        AND (n.rawCode LIKE %:className% OR n.metadata::text LIKE %:className%)
+        AND n.id != :excludeId
+        ORDER BY n.nodeType
+        """)
+    List<AstNode> findRelatedByClassName(
+            @Param("repoUrl") String repoUrl,
+            @Param("className") String className,
+            @Param("excludeId") String excludeId
+    );
+
+    @Query("""
+        SELECT n FROM ASTNode n
+        WHERE n.repoUrl = :repoUrl
+        AND n.filePath = :filePath
+        """)
+    List<AstNode> findByRepoUrlAndFilePath(
+            @Param("repoUrl") String repoUrl,
+            @Param("filePath") String filePath
+    );
 }
