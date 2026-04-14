@@ -1,0 +1,19 @@
+package com.example.demo.dto;
+
+import com.example.demo.entity.AstNode;
+import lombok.AllArgsConstructor;
+import lombok.Builder;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+
+@Data
+@Builder
+@NoArgsConstructor
+@AllArgsConstructor
+public class AgentRequest {
+    private String activeNodeId;
+    private String repoUrl;
+    private String userPrompt;
+    private String demoPayload;
+    private String sessionId;
+}
