@@ -1,7 +1,7 @@
 package com.example.demo.repository;
 
 import com.example.demo.entity.AstNode;
-import org.aspectj.weaver.ast.ASTNode;
+
 import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
@@ -16,6 +16,10 @@ public interface AstNodeRepository extends JpaRepository<AstNode, UUID> {
 
     List<AstNode> findByProjectId(UUID projectId);
     List<AstNode> findByProjectIdAndNodeType(UUID projectId, String nodeType);
+
+    Optional<AstNode> findByIdAndRepoUrl(String id, String repoUrl);
+
+    List<AstNode> findByRepoUrlAndNodeType(String repoUrl, String nodeType);
 
     // Check if AI explanation already exists for this node (cache hit check)
     @Query("SELECT n FROM AstNode n WHERE n.id = :id AND n.aiExplanation IS NOT NULL")
