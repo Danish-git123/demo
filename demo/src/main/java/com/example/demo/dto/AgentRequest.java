@@ -12,8 +12,8 @@ import lombok.NoArgsConstructor;
 @AllArgsConstructor
 public class AgentRequest {
     private String activeNodeId;
-    private String repoUrl;
+    private String projectId;
     private String userPrompt;
     private String demoPayload;
-    private String sessionId;
+    private String detectedFramwork;
 }
