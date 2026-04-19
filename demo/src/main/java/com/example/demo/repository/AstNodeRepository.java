@@ -17,9 +17,9 @@ public interface AstNodeRepository extends JpaRepository<AstNode, UUID> {
     List<AstNode> findByProjectId(UUID projectId);
     List<AstNode> findByProjectIdAndNodeType(UUID projectId, String nodeType);
 
-    Optional<AstNode> findByIdAndRepoUrl(String id, String repoUrl);
+    // REPLACED 'repoUrl' with 'projectId' to match your actual database relations
+    Optional<AstNode> findByIdAndProjectId(UUID id, UUID projectId);
 
-    List<AstNode> findByRepoUrlAndNodeType(String repoUrl, String nodeType);
 
     // Check if AI explanation already exists for this node (cache hit check)
     @Query("SELECT n FROM AstNode n WHERE n.id = :id AND n.aiExplanation IS NOT NULL")
@@ -31,27 +31,20 @@ public interface AstNodeRepository extends JpaRepository<AstNode, UUID> {
     // Delete all nodes for a project (when re-analyzing)
     void deleteByProjectId(UUID projectId);
 
-    // Find nodes that reference a specific class name — for dependency resolution
+    // UPDATED: Now filters strictly by projectId, searches within rawCode, and uses UUIDs
     @Query("""
-        SELECT n FROM ASTNode n
-        WHERE n.repoUrl = :repoUrl
-        AND (n.rawCode LIKE %:className% OR n.metadata::text LIKE %:className%)
+        SELECT n FROM AstNode n
+        WHERE n.project.id = :projectId
+        AND n.rawCode LIKE %:identifier%
         AND n.id != :excludeId
         ORDER BY n.nodeType
         """)
-    List<AstNode> findRelatedByClassName(
-            @Param("repoUrl") String repoUrl,
-            @Param("className") String className,
-            @Param("excludeId") String excludeId
+    List<AstNode> findRelatedByIdentifier(
+            @Param("projectId") UUID projectId,
+            @Param("identifier") String identifier,
+            @Param("excludeId") UUID excludeId
     );
 
-    @Query("""
-        SELECT n FROM ASTNode n
-        WHERE n.repoUrl = :repoUrl
-        AND n.filePath = :filePath
-        """)
-    List<AstNode> findByRepoUrlAndFilePath(
-            @Param("repoUrl") String repoUrl,
-            @Param("filePath") String filePath
-    );
+    // REPLACED 'repoUrl' with 'projectId'
+    List<AstNode> findByProjectIdAndFilePath(UUID projectId, String filePath);
 }
