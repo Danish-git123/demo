@@ -16,4 +16,5 @@ public class AgentRequest {
     private String userPrompt;
     private String demoPayload;
     private String detectedFramwork;
+    private String conversationId;//this is for the session to track
 }

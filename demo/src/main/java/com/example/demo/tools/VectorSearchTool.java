@@ -39,19 +39,19 @@ public class VectorSearchTool {
                     """
     )
     public String semanticCodeSearch(
-            @ToolParam(description = "Natural language description of what user is looking for ,e.g ., ->'JWT token validation' or 'database transaction handling any query by the user ")String semanticQuery,
+            @ToolParam(description = "The specific technical concept to search for (e.g., 'JWT SecurityFilterChain' instead of 'auth')") String expandedTechnicalQuery,
             @ToolParam(description = "The UUID of project being analyzed") String projectId,
-            @ToolParam(description = "Maximum number of results to return (1-10,default 5)")int maxResults
+            @ToolParam(description = "Maximum results to return") int maxResults
     ){
-        log.info("[VectorSearch] Semantic query: '{}' in project: {}", semanticQuery, projectId);
+        log.info("[VectorSearch] Semantic query: '{}' in project: {}", expandedTechnicalQuery, projectId);
 
         int limit=Math.max(1,Math.min(maxResults,10));
 
         try{
             SearchRequest searchRequest = SearchRequest.builder()
-                    .query(semanticQuery)
+                    .query(expandedTechnicalQuery) // Now uses the smart, expanded query
                     .topK(limit)
-                    .filterExpression("projecctid== '" + projectId + "'")
+                    .filterExpression("projectId == '" + projectId + "'") // Note: Fixed the typo 'projecctid' from your original code
                     .build();
 
             List<Document> results = vectorStore.similaritySearch(searchRequest);
@@ -76,7 +76,7 @@ public class VectorSearchTool {
             }).toList();
 
             return objectMapper.writeValueAsString(
-                    Map.of("query", semanticQuery, "count", formattedResults.size(), "results", formattedResults)
+                    Map.of("query", expandedTechnicalQuery, "count", formattedResults.size(), "results", formattedResults)
             );
         } catch (Exception e) {
             log.error("Eroor is smeanticCodeSerach Tool",e.getMessage());

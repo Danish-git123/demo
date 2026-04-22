@@ -71,6 +71,8 @@ public class ASTNavigatorTool {
             return "{\"error\": \"Failed to serialize node data.\"}";
         }
     }
+
+
     @Tool(
             name = "fetchNodeDependencies",
             description = """

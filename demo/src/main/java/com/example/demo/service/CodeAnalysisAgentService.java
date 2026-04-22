@@ -7,10 +7,17 @@ import com.example.demo.tools.VectorSearchTool;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.ai.chat.client.ChatClient;
+import org.springframework.ai.chat.memory.ChatMemory;
+import org.springframework.ai.document.Document;
+import org.springframework.ai.vectorstore.SearchRequest;
+import org.springframework.ai.vectorstore.VectorStore;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import reactor.core.publisher.Flux;
+
+import java.util.List;
+import java.util.stream.Collectors;
 
 @Service
 @Slf4j
@@ -25,6 +32,10 @@ public class CodeAnalysisAgentService {
 
     private final ChatClient.Builder chatClientBuilder;
 
+    private final ChatMemory chatMemory;
+    private final VectorStore vectorStore;
+
+
     @Value("${agent.max-iterations:8}")
     private int maxIterations;
 
@@ -38,12 +49,15 @@ public class CodeAnalysisAgentService {
         log.info("[Agent] Starting streaming analysis. Project: {}, Node: {}",
                 request.getProjectId(), request.getActiveNodeId());
 
+        String semanticContext=fetchSemanticMemoryProgrammatically(request.getUserPrompt(),request.getProjectId());
+
         ChatClient chatClient=buildAgentChatClient();
 
         String systemPrompt=buildSystemPrompt(request.getDetectedFramwork());
 
         String userMessage=buildUserMessage(request);
 
+//        this is streaming response
         return chatClient.prompt()
                 .system(systemPrompt)
                 .user(userMessage)
@@ -52,6 +66,28 @@ public class CodeAnalysisAgentService {
                 .content()
                 .doOnError(e->log.error("[Agent] Streaming error",e));
 
+    }
+
+    private String fetchSemanticMemoryProgrammatically(String userQuery,String projectId){
+        try{
+            SearchRequest searchRequest=SearchRequest.builder()
+                    .query(userQuery)
+                    .topK(3)
+                    .filterExpression("projectId== '"+projectId+"' && memoryType =='semantic_rule'")
+                    .build();
+            List<Document> results = vectorStore.similaritySearch(searchRequest);
+            if (results.isEmpty()) {
+                return "No pre-existing semantic memory found for this query. You must deduce the architecture from the AST tools.";
+            }
+
+            return results.stream()
+                    .map(Document::getFormattedContent)
+                    .collect(Collectors.joining("\n- "));
+        } catch (Exception e) {
+            log.error((e.getMessage()));
+            return "Memory retrieval failed. Proceed with standard AST analysis.";
+
+        }
     }
 
     private String buildSystemPrompt(String framework) {
