@@ -54,9 +54,7 @@ public class Project {
     @OneToMany(mappedBy = "project", cascade = CascadeType.ALL, fetch = FetchType.LAZY)
     private List<AstNode> nodes;
 
-    // One project has many chat messages
-    @OneToMany(mappedBy = "project", cascade = CascadeType.ALL, fetch = FetchType.LAZY)
-    private List<ChatMessage> chatMessages;
+
 
     @PrePersist
     protected void onCreate() {
