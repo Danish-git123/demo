@@ -138,5 +138,49 @@ public class ASTNavigatorTool {
         }
     }
 
+    @Tool(
+            name = "searchNodeByName",
+            description = """
+            Searches the project structure for a specific node by its name or label (e.g., 'OwnerRepository', 'PersonEntity', 'UserController').
+            ALWAYS use this tool FIRST when the user asks a question about a specific class, file, or component.
+            It returns the exact nodeId, file path, and raw code of the requested component.
+            """
+    )
+    public String searchNodeByName(
+            @ToolParam(description = "The name of the class, file, or node to search for") String nodeName,
+            @ToolParam(description = "The UUID of the project being analyzed") String projectId
+    ){
+        log.info("[ASTNavigator] Searching for node by name: {} in project: {}", nodeName, projectId);
+
+        try {
+            UUID projectUuid = UUID.fromString(projectId);
+
+            // Database me naam se search karo
+            List<AstNode> nodes = astNodeRepository.findByLabelContainingIgnoreCaseAndProjectId(nodeName, projectUuid);
+
+            if (nodes.isEmpty()) {
+                return String.format("{\"error\": \"No component found with name '%s' in this project. Try using semanticCodeSearch instead.\"}", nodeName);
+            }
+
+            // Agar mil gaya, toh pehla exact match utha lo
+            AstNode node = nodes.get(0);
+
+            Map<String,Object> result = Map.of(
+                    "nodeId", node.getId(),
+                    "nodeType", node.getNodeType(),
+                    "label", node.getLabel() != null ? node.getLabel() : "N/A",
+                    "filePath", node.getFilePath() != null ? node.getFilePath() : "N/A",
+                    "rawCode", node.getRawCode() != null ? node.getRawCode() : ""
+            );
+            return objectMapper.writeValueAsString(result);
+
+        } catch (IllegalArgumentException e) {
+            return "{\"error\": \"Invalid UUID format for projectId.\"}";
+        } catch (Exception e) {
+            log.error("[ASTNavigator] Search by name error: ", e);
+            return "{\"error\": \"Failed to search node by name.\"}";
+        }
+    }
+
 
 }

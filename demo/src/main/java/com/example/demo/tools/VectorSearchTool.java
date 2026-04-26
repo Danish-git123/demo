@@ -32,7 +32,6 @@ public class VectorSearchTool {
                                 Good use cases:
                                 - Finding all authentication/authorization logic
                                 - Locating error handling patterns
-                                - Finding validation logic across different files
                                 - Discovering where a business concept is implemented
                     
                                 Always combine results with fetchNodeStructure for complete context.
@@ -45,20 +44,24 @@ public class VectorSearchTool {
     ){
         log.info("[VectorSearch] Semantic query: '{}' in project: {}", expandedTechnicalQuery, projectId);
 
-        int limit=Math.max(1,Math.min(maxResults,10));
+        int limit = Math.max(1, Math.min(maxResults, 10));
 
-        try{
+        try {
             SearchRequest searchRequest = SearchRequest.builder()
-                    .query(expandedTechnicalQuery) // Now uses the smart, expanded query
-                    .topK(limit)
-                    .filterExpression("projectId == '" + projectId + "'") // Note: Fixed the typo 'projecctid' from your original code
+                    .query(expandedTechnicalQuery)
+                    // Fetch extra records initially to account for any memory pollution we will filter out
+                    .topK(limit + 15)
+                    .filterExpression("projectId == '" + projectId + "'")
                     .build();
 
-            List<Document> results = vectorStore.similaritySearch(searchRequest);
+            // CRITICAL FIX: Filter out episodic and semantic memories so we ONLY return actual codebase nodes!
+            List<Document> results = vectorStore.similaritySearch(searchRequest).stream()
+                    .filter(doc -> !doc.getMetadata().containsKey("memoryType"))
+                    .limit(limit)
+                    .toList();
 
             if(results.isEmpty()){
                 return "{\"message\": \"No semantically similar code found. Try rephrasing your query or broadening the concept.\", \"count\": 0}";
-
             }
 
             List<Map<String, Object>> formattedResults = results.stream().map(doc -> {
@@ -67,7 +70,7 @@ public class VectorSearchTool {
                 map.put("nodeId", metadata.getOrDefault("nodeId", "unknown"));
                 map.put("filePath", metadata.getOrDefault("filePath", "unknown"));
                 map.put("nodeType", metadata.getOrDefault("nodeType", "unknown"));
-                map.put("label", metadata.getOrDefault("label", "unknown")); // Replaced className with label
+                map.put("label", metadata.getOrDefault("label", "unknown"));
 
                 String content = doc.getFormattedContent();
                 map.put("codeSnippet", content != null ? content.substring(0, Math.min(800, content.length())) : "");
@@ -79,7 +82,7 @@ public class VectorSearchTool {
                     Map.of("query", expandedTechnicalQuery, "count", formattedResults.size(), "results", formattedResults)
             );
         } catch (Exception e) {
-            log.error("Eroor is smeanticCodeSerach Tool",e.getMessage());
+            log.error("Error in semanticCodeSearch Tool", e.getMessage());
             return "{\"error\": \"Vector search failed: " + e.getMessage() + "\"}";
         }
     }
@@ -97,40 +100,43 @@ public class VectorSearchTool {
             @ToolParam(description = "The UUID of the project being analyzed") String projectId,
             @ToolParam(description = "The source node ID to exclude from results") String excludeNodeId
     ) {
+        log.info("[VectorSearch] Finding nodes similar to code snippet in project: {}, excluding: {}", projectId, excludeNodeId);
 
-            log.info("[VectorSearch] Finding nodes similar to code snippet in project: {}, excluding: {}", projectId, excludeNodeId);
+        try{
+            SearchRequest searchRequest = SearchRequest.builder()
+                    .query(codeSnippet)
+                    .topK(15) // Fetch extra to safely filter
+                    .filterExpression("projectId == '" + projectId + "' && nodeId != '" + excludeNodeId + "'")
+                    .build();
 
-            try{
-                SearchRequest searchRequest = SearchRequest.builder()
-                        .query(codeSnippet)
-                        .topK(5)
-                        .filterExpression("projectId == '" + projectId + "' && nodeId != '" + excludeNodeId + "'")
-                        .build();
+            // CRITICAL FIX: Block memories here too
+            List<Document> results = vectorStore.similaritySearch(searchRequest).stream()
+                    .filter(doc -> !doc.getMetadata().containsKey("memoryType"))
+                    .limit(5)
+                    .toList();
 
-                List<Document> results = vectorStore.similaritySearch(searchRequest);
-                List<Map<String, Object>> formattedResults = results.stream()
-                        .map(doc -> {
-                            Map<String, Object> metadata = doc.getMetadata();
-                            // Using standard HashMap for type safety
-                            Map<String, Object> map = new java.util.HashMap<>();
-                            map.put("nodeId", metadata.getOrDefault("nodeId", "unknown"));
-                            map.put("filePath", metadata.getOrDefault("filePath", "unknown"));
-                            map.put("label", metadata.getOrDefault("label", "unknown"));
+            List<Map<String, Object>> formattedResults = results.stream()
+                    .map(doc -> {
+                        Map<String, Object> metadata = doc.getMetadata();
+                        Map<String, Object> map = new java.util.HashMap<>();
+                        map.put("nodeId", metadata.getOrDefault("nodeId", "unknown"));
+                        map.put("filePath", metadata.getOrDefault("filePath", "unknown"));
+                        map.put("label", metadata.getOrDefault("label", "unknown"));
 
-                            String content = doc.getFormattedContent();
-                            map.put("codeSnippet", content != null ? content.substring(0, Math.min(600, content.length())) : "");
+                        String content = doc.getFormattedContent();
+                        map.put("codeSnippet", content != null ? content.substring(0, Math.min(600, content.length())) : "");
 
-                            return map;
-                        })
-                        .toList();
+                        return map;
+                    })
+                    .toList();
 
-                return objectMapper.writeValueAsString(
-                        Map.of("similarNodesCount", formattedResults.size(), "similarNodes", formattedResults)
-                );
-            } catch (Exception e) {
-                log.error("Error in findSImilarNodes tool",e.getMessage());
-                return "{\"error\": \"Failed to find similar nodes: " + e.getMessage() + "\"}";
-            }
+            return objectMapper.writeValueAsString(
+                    Map.of("similarNodesCount", formattedResults.size(), "similarNodes", formattedResults)
+            );
+        } catch (Exception e) {
+            log.error("Error in findSimilarNodes tool", e.getMessage());
+            return "{\"error\": \"Failed to find similar nodes: " + e.getMessage() + "\"}";
+        }
     }
 }
 
