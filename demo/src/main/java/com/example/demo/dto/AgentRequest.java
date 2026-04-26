@@ -17,4 +17,13 @@ public class AgentRequest {
     private String demoPayload;
     private String detectedFramwork;
     private String conversationId;//this is for the session to track
+
+    public String getActiveNodeId() {
+        if (this.activeNodeId == null
+                || this.activeNodeId.trim().equalsIgnoreCase("null")
+                || this.activeNodeId.trim().isEmpty()) {
+            return null; // Return strict null so the Service layer knows no node was selected
+        }
+        return this.activeNodeId;
+    }
 }
