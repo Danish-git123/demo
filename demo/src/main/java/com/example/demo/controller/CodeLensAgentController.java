@@ -9,8 +9,8 @@ import org.springframework.web.bind.annotation.*;
 import reactor.core.publisher.Flux;
 
 @RestController
-@RequestMapping("/api/agent")
-//@CrossOrigin(origins = "*") // Allows your React frontend to connect without CORS errors
+@RequestMapping("/agent")
+@CrossOrigin(origins = "*") 
 @RequiredArgsConstructor
 @Slf4j
 public class CodeLensAgentController {
