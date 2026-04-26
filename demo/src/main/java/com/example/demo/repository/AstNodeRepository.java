@@ -47,4 +47,7 @@ public interface AstNodeRepository extends JpaRepository<AstNode, UUID> {
 
     // REPLACED 'repoUrl' with 'projectId'
     List<AstNode> findByProjectIdAndFilePath(UUID projectId, String filePath);
+
+    // AstNodeRepository.java ke andar ye add kar de
+    List<AstNode> findByLabelContainingIgnoreCaseAndProjectId(String label, UUID projectId);
 }
