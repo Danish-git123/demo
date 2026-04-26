@@ -45,6 +45,7 @@ public class SecurityConfig {
                 // Route access rules
                 .authorizeHttpRequests(auth -> auth
 
+                        .dispatcherTypeMatchers(jakarta.servlet.DispatcherType.ASYNC).permitAll()
                         .requestMatchers("/api/health").permitAll()
 
 
